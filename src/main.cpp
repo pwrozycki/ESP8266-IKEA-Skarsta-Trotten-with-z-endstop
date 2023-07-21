@@ -1,13 +1,16 @@
 #include <ESP8266WiFi.h>
-#include <WiFiClient.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266mDNS.h>
 #include <uri/UriBraces.h>
-#include <uri/UriRegex.h>
-#include "index.h"
 #include "CytronMotorDriver.h"
+#include "main.h"
 
 #define DEBUG
+
+
+#if __has_include("secrets.h")
+#include "secrets.h"
+#endif
 
 /* WiFi configuration */
 #ifndef STASSID
@@ -44,6 +47,18 @@ typedef enum {
 state_t g_system_state = CALIBRATING;
 
 int g_opto_state = -1;
+unsigned long g_last_on_hold_time = 0;
+unsigned long g_last_opto_change_time = 0;
+
+void motor_stuck_protection();
+
+int get_current_height();
+
+void stop_table();
+
+void stop_motor_reset_position();
+
+bool opto_sensor_not_changing_when_motor_on();
 
 /* Maximum and minimum height of the table in cm */
 const unsigned int MAX_HEIGHT = 120;/* 120 cm is the offical maximum height from the IKEA manual */
@@ -66,7 +81,7 @@ int g_endstop_value_trig_times = 0;
  * Displays the index/main page in the browser of the client
  */
 void display_index() {
-  String s = MAIN_page; // read HTML contents from the MAIN_page variable which was stored in the flash (program) memory instead of SRAM, see index.h
+  String s = MAIN_page; // read HTML contents from the MAIN_page variable which was stored in the flash (program) memory instead of SRAM, see main.h
   server.send(200, "text/html", s); // send web page
 }
 
@@ -75,7 +90,7 @@ void display_index() {
  * e.g. when motor up was clicked it shall go back to the homepage
  */
 void send_homepage_redirection() {
-  server.sendHeader("Location","/"); // Client shall redirect to "/"
+  server.sendHeader("Location", "/"); // Client shall redirect to "/"
   server.send(303);
 }
 
@@ -87,16 +102,13 @@ void send_homepage_redirection() {
 void handle_motor_requests() {
   String action = server.pathArg(0); // retrieve the given argument/action
 
-  if(action == "up"){
+  if (action == "up") {
     g_system_state = UP;
-  }
-  else if(action == "stop"){
+  } else if (action == "stop") {
     g_system_state = HOLD;
-  }
-  else if(action == "down"){
+  } else if (action == "down") {
     g_system_state = DOWN;
-  }
-  else {
+  } else {
     Serial.println("Error: Action is unknown"); // system will stay in its previous state
   }
 
@@ -114,7 +126,7 @@ void handle_height_requests() {
   int height = atoi((server.pathArg(0)).c_str()); // convert string parameter to integer
 
   // only change the state if the given height is in the height boundaries
-  if(height >= MIN_HEIGHT and height <= MAX_HEIGHT) {
+  if (height >= MIN_HEIGHT and height <= MAX_HEIGHT) {
     int current_height = get_current_height();
     if (current_height < height) {
       g_custom_height = height;
@@ -190,7 +202,14 @@ void register_server_routes() {
   server.on(F("/"), display_index); // route: /
   server.on(UriBraces("/motor/{}"), handle_motor_requests); // route: /motor/<string: action>/
   server.on(UriBraces("/height/{}"), handle_height_requests); // route: /height/<string: height_in_cm>/
-  server.on(UriBraces("/height"), handle_read_height_requests); // route: /height/ - is being called from client javascript
+  server.on(UriBraces("/height"),
+            handle_read_height_requests); // route: /height/ - is being called from client javascript
+}
+
+void init_timestamps() {
+  unsigned long now = millis();
+  g_last_on_hold_time = now;
+  g_last_opto_change_time = now;
 }
 
 /*
@@ -211,6 +230,8 @@ void setup(void) {
   // Start the server
   server.begin();
   Serial.println("HTTP server started");
+
+  init_timestamps();
 }
 
 /*
@@ -218,19 +239,17 @@ void setup(void) {
  * ultrasonic sensor.
  */
 int get_current_height() {
-  int height = (int) g_opto_position / 4.0 / ROTATION_TO_HEIGHT_RATIO + MIN_HEIGHT;
-  return height; // return height
+  return (int) g_opto_position / 4.0 / ROTATION_TO_HEIGHT_RATIO + MIN_HEIGHT; // return height
 }
 
 /*
  * Raise the table until the max height is reached
  */
 void raise_table() {
-  if(MAX_HEIGHT >= get_current_height()) {
+  if (get_current_height() < MAX_HEIGHT) {
     motor.setSpeed(MOTOR_SPEED);
-  }
-  else {
-    g_system_state = HOLD;
+  } else {
+    stop_table();
   }
 }
 
@@ -238,10 +257,10 @@ void raise_table() {
  * Lower the table until the min height is reached
  */
 void lower_table() {
-  if (MIN_HEIGHT <= get_current_height()) {
+  if (get_current_height() >= MIN_HEIGHT) {
     motor.setSpeed(-MOTOR_SPEED); // two's complement for negating the integer
   } else {
-    g_system_state = HOLD;
+    stop_table();
   }
 }
 
@@ -250,26 +269,32 @@ void lower_table() {
  */
 void stop_table() {
   motor.setSpeed(0);
+  g_custom_height = -1;
+  g_system_state = HOLD;
+}
+
+bool custom_height_reached() {
+  return g_custom_height != -1 && g_custom_height == get_current_height();
 }
 
 /*
  * Controls the motor based on the system state g_system_state. This is pretty much the core FSM implementation for the state transistions.
  */
 void handle_output() {
-  if (g_custom_height != -1 && g_custom_height == get_current_height()) {
+  if (custom_height_reached()) {
+    Serial.println("Custom height reached ... switching to HOLD state");
     g_system_state = HOLD;
   }
 
   switch (g_system_state) {
     case UP:
-      raise_table(); // motor go up
+      raise_table();
       break;
     case DOWN:
-      lower_table(); // motor go down
+      lower_table(); // two's complement for negating the integer
       break;
     case HOLD:
-      stop_table(); // stop the motor
-      g_custom_height = -1;
+      stop_table();
       break;
   }
 }
@@ -298,28 +323,26 @@ void handle_endstop() {
 
 void stop_motor_reset_position() {
   Serial.println("Endstop reached ... stopping motor, resetting position");
-  motor.setSpeed(0);
-  int opto_sensor_value = digitalRead(OPTO_SENSOR);
-  g_opto_state = opto_sensor_value;
+  stop_table();
   g_opto_position = 0;
-  g_system_state = HOLD;
 }
 
 void track_position() {
-  if (g_system_state == UP || g_system_state == DOWN) {
-    int opto_sensor_value = digitalRead(OPTO_SENSOR);
+  int cur_opto_state = digitalRead(OPTO_SENSOR);
 
+  unsigned long now = millis();
+
+  if (g_opto_state != cur_opto_state) {
     Serial.println("Current position :" + String(g_opto_position) +
-        " state: " + String(opto_sensor_value) + " / " + String(g_opto_state));
+                   " state: " + String(cur_opto_state) + " / " + String(g_opto_state));
 
-    if (g_opto_state != opto_sensor_value) {
-      g_opto_state = opto_sensor_value;
-      if (g_system_state == UP) {
-        g_opto_position += 1;
-      } else {
-        g_opto_position -= 1;
-      }
+    g_opto_state = cur_opto_state;
+    g_last_opto_change_time = now;
 
+    if (g_system_state == UP) {
+      g_opto_position += 1;
+    } else {
+      g_opto_position -= 1;
     }
   }
 }
@@ -333,8 +356,26 @@ void loop(void) {
   handle_endstop();
 
   if (g_system_state != CALIBRATING) {
-    track_position();
     server.handleClient(); // gets input from a client
     handle_output(); // controls the height of the table based on the input
   }
+
+  track_position();
+  motor_stuck_protection();
+}
+
+void motor_stuck_protection() {
+  if (g_system_state == HOLD) {
+    g_last_on_hold_time = millis();
+  } else if (opto_sensor_not_changing_when_motor_on()) {
+    Serial.println("Motor stuck condition detected ... switching to HOLD state.");
+    g_system_state = HOLD;
+  }
+}
+
+bool opto_sensor_not_changing_when_motor_on() {
+  unsigned long now = millis();
+
+  return now - g_last_opto_change_time > 500 &&
+         now - g_last_on_hold_time > 500;
 }
